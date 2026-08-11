@@ -1,0 +1,77 @@
+name: Temporary Aqua claim history
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-claim-history.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find and decode all recent Merkl claims
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8' requests
+          python3 - <<'PY'
+          from web3 import Web3
+          from hexbytes import HexBytes
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone, timedelta
+          import requests
+          getcontext().prec=80
+          TARGET='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          DIST='0x3ef3d8ba38ebe18db133cec108f4d14ce00dd9ae'
+          META={
+            '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
+            '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),
+            '0x1f9840a85d5af5bf1d1762f925bdaddc4201f984':('UNI',18),
+          }
+          # Find all direct claim calls by paginating the address's own transactions.
+          base=f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/transactions'
+          params={}; claim_hashes=[]; seen=set()
+          for page in range(1,31):
+            r=requests.get(base,params=params,timeout=60,headers={'user-agent':'Mozilla/5.0','accept':'application/json'})
+            print('PAGE|%s|status=%s' % (page,r.status_code)); r.raise_for_status(); data=r.json(); items=data.get('items') or []
+            if not items: break
+            oldest=None
+            for item in items:
+              oldest=item.get('timestamp') or oldest
+              to=((item.get('to') or {}).get('hash') or '').lower()
+              frm=((item.get('from') or {}).get('hash') or '').lower()
+              method=(item.get('method') or '').lower()
+              if frm==TARGET and to==DIST and method=='claim':
+                h=item.get('hash')
+                if h and h not in seen:
+                  seen.add(h); claim_hashes.append(h)
+                  print('CLAIM_CALL|timestamp=%s|hash=%s|status=%s' % (item.get('timestamp'),h,item.get('status')))
+            nxt=data.get('next_page_params')
+            if not isinstance(nxt,dict) or not nxt: break
+            params=nxt
+            if oldest and oldest < '2026-07-25': break
+          print('CLAIM_CALL_COUNT|%s' % len(claim_hashes))
+
+          w3=None
+          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60})); _=c.eth.block_number; w3=c; print('RPC|%s' % rpc); break
+            except Exception as exc: print('RPC_FAIL|%s|%r' % (rpc,exc))
+          if w3 is None: raise SystemExit('no rpc')
+          transfer=Web3.keccak(text='Transfer(address,address,uint256)').hex(); grand={}
+          for txh in sorted(claim_hashes, key=lambda h:w3.eth.get_transaction_receipt(h)['blockNumber']):
+            receipt=w3.eth.get_transaction_receipt(txh); block=w3.eth.get_block(receipt['blockNumber']); ts=int(block['timestamp']); utc=datetime.fromtimestamp(ts,timezone.utc); jst=utc.astimezone(timezone(timedelta(hours=9)))
+            sums={}
+            for log in receipt['logs']:
+              topics=log['topics']
+              if len(topics)!=3 or topics[0].hex()!=transfer: continue
+              frm='0x'+topics[1].hex()[-40:]; to='0x'+topics[2].hex()[-40:]
+              if frm.lower()!=DIST or to.lower()!=TARGET: continue
+              token=log['address'].lower(); sym,dec=META.get(token,(token[:10],18)); raw=int.from_bytes(HexBytes(log['data']),'big'); amount=Decimal(raw)/(Decimal(10)**dec)
+              sums[sym]=sums.get(sym,Decimal(0))+amount; grand[sym]=grand.get(sym,Decimal(0))+amount
+            print('CLAIM|jst=%s|utc=%s|block=%s|tx=%s|tokens=%s' % (jst.strftime('%Y-%m-%d %H:%M:%S JST'),utc.isoformat(),receipt['blockNumber'],txh,','.join('%s=%s' % x for x in sorted(sums.items())) or 'none'))
+          for sym,total in sorted(grand.items()): print('CLAIM_GRAND_TOTAL|symbol=%s|amount=%s' % (sym,total))
+          PY
