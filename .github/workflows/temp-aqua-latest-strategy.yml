@@ -19,6 +19,7 @@ jobs:
           python3 -m pip install --quiet 'web3>=7,<8'
           python3 - <<'PY'
           from web3 import Web3
+          from hexbytes import HexBytes
           from decimal import Decimal, getcontext
           getcontext().prec=80
 
@@ -44,10 +45,11 @@ jobs:
             except Exception as exc: print('RPC_FAIL|%s|%r' % (rpc,exc))
           if w3 is None: raise SystemExit('no rpc')
           aqua=w3.eth.contract(address=Web3.to_checksum_address(AQUA),abi=ABI)
-          safe=aqua.functions.safeBalances(Web3.to_checksum_address(TARGET),Web3.to_checksum_address(APP),HexBytes(STRATEGY),Web3.to_checksum_address(TOKENS[0][1]),Web3.to_checksum_address(TOKENS[1][1])).call()
+          strategy=HexBytes(STRATEGY)
+          safe=aqua.functions.safeBalances(Web3.to_checksum_address(TARGET),Web3.to_checksum_address(APP),strategy,Web3.to_checksum_address(TOKENS[0][1]),Web3.to_checksum_address(TOKENS[1][1])).call()
           print('SAFE_BALANCES|1INCH=%s|SPYx=%s' % (Decimal(safe[0])/Decimal(10**18),Decimal(safe[1])/Decimal(10**18)))
           for sym,token,dec in TOKENS:
-            raw,count=aqua.functions.rawBalances(Web3.to_checksum_address(TARGET),Web3.to_checksum_address(APP),HexBytes(STRATEGY),Web3.to_checksum_address(token)).call()
+            raw,count=aqua.functions.rawBalances(Web3.to_checksum_address(TARGET),Web3.to_checksum_address(APP),strategy,Web3.to_checksum_address(token)).call()
             wallet=w3.eth.contract(address=Web3.to_checksum_address(token),abi=ERC20).functions.balanceOf(Web3.to_checksum_address(TARGET)).call()
             print('TOKEN|symbol=%s|virtual=%s|tokens_count=%s|wallet_balance=%s' % (sym,Decimal(raw)/(Decimal(10)**dec),count,Decimal(wallet)/(Decimal(10)**dec)))
           PY
