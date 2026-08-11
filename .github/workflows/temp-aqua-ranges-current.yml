@@ -1,0 +1,103 @@
+name: Temporary current Aqua ranges
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-ranges-current.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Export recent active ships
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8' requests
+          python3 - <<'PY'
+          import json, requests
+          from web3 import Web3
+          from web3.logs import DISCARD
+          from hexbytes import HexBytes
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone, timedelta
+          getcontext().prec=90
+          T='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'; A='0x1111113ccf1426a8e30e2bff5e005d929bf6a90a'; START='2026-08-08T00:00:00.000000Z'
+          ABI=[
+            {'type':'function','name':'ship','stateMutability':'nonpayable','inputs':[{'name':'app','type':'address'},{'name':'strategy','type':'bytes'},{'name':'tokens','type':'address[]'},{'name':'amounts','type':'uint256[]'}],'outputs':[{'type':'bytes32'}]},
+            {'type':'function','name':'dock','stateMutability':'nonpayable','inputs':[{'name':'app','type':'address'},{'name':'strategyHash','type':'bytes32'},{'name':'tokens','type':'address[]'}],'outputs':[]},
+            {'type':'event','name':'Shipped','anonymous':False,'inputs':[{'indexed':False,'name':'maker','type':'address'},{'indexed':False,'name':'app','type':'address'},{'indexed':False,'name':'strategyHash','type':'bytes32'},{'indexed':False,'name':'strategy','type':'bytes'}]},
+          ]
+          ERC=[{'type':'function','name':'symbol','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},{'type':'function','name':'decimals','stateMutability':'view','inputs':[],'outputs':[{'type':'uint8'}]}]
+          w3=None
+          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60}));_=c.eth.block_number;w3=c;print('RPC|%s|latest=%s'%(rpc,c.eth.block_number));break
+            except Exception as e:print('RPC_FAIL|%s|%r'%(rpc,e))
+          if w3 is None:raise SystemExit('no rpc')
+          aqua=w3.eth.contract(address=Web3.to_checksum_address(A),abi=ABI)
+          cache={'0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),'0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0':('wstETH',18),'0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':('WETH',18),'0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),'0xdac17f958d2ee523a2206206994597c13d831ec7':('USDT',6),'0x2260fac5e5542a773aa44fbcfedf7c193bc2c599':('WBTC',8),'0x1f9840a85d5af5bf1d1762f925bdaddc4201f984':('UNI',18)}
+          def meta(a):
+            a=a.lower()
+            if a in cache:return cache[a]
+            sym=a[:10];dec=18
+            try:
+              c=w3.eth.contract(address=Web3.to_checksum_address(a),abi=ERC);sym=c.functions.symbol().call();dec=int(c.functions.decimals().call())
+            except Exception:pass
+            cache[a]=(sym,dec);return sym,dec
+          def jst(ts):return datetime.fromtimestamp(ts,timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'});params={};rows=[]
+          for page in range(1,40):
+            r=s.get(f'https://eth.blockscout.com/api/v2/addresses/{T}/transactions',params=params,timeout=60);r.raise_for_status();d=r.json();items=d.get('items') or []
+            if not items:break
+            oldest=None
+            for x in items:
+              stamp=x.get('timestamp');oldest=stamp or oldest;frm=((x.get('from') or {}).get('hash') or '').lower();to=((x.get('to') or {}).get('hash') or '').lower();method=(x.get('method') or '').lower()
+              if stamp and stamp>=START and frm==T and to==A and method in ('ship','dock') and x.get('hash'):rows.append((stamp,method,x['hash']))
+            nxt=d.get('next_page_params')
+            if not isinstance(nxt,dict) or not nxt or (oldest and oldest<START):break
+            params=nxt
+          ships=[];docked=set()
+          for stamp,method,h in rows:
+            try:
+              tx=w3.eth.get_transaction(h);rc=w3.eth.get_transaction_receipt(h);ts=int(w3.eth.get_block(rc['blockNumber'])['timestamp']);fn,args=aqua.decode_function_input(tx['input'])
+            except Exception as e:
+              print('SKIP_TX|hash=%s|error=%r'%(h,e));continue
+            if method=='dock':docked.add(('0x'+args['strategyHash'].hex().removeprefix('0x')).lower());continue
+            sh=None
+            for ev in aqua.events.Shipped().process_receipt(rc,errors=DISCARD):
+              if ev['args']['maker'].lower()==T:sh='0x'+ev['args']['strategyHash'].hex().removeprefix('0x');break
+            if not sh:print('SKIP_NO_HASH|%s'%h);continue
+            toks=[]
+            for t,raw in zip(args['tokens'],args['amounts']):
+              a=t.lower();sym,dec=meta(a);toks.append({'address':a,'symbol':sym,'decimals':dec,'amount':str(Decimal(int(raw))/(Decimal(10)**dec))})
+            ships.append({'timestamp':ts,'jst':jst(ts),'tx':h,'app':args['app'].lower(),'strategyHash':sh,'encodedOrder':'0x'+HexBytes(args['strategy']).hex().removeprefix('0x'),'tokens':toks})
+          for x in ships:x['active']=x['strategyHash'].lower() not in docked
+          active=sorted([x for x in ships if x['active']],key=lambda x:x['timestamp'])
+          print('LIFECYCLE|ship_rows=%s|decoded_ships=%s|docked=%s|active=%s'%(sum(1 for x in rows if x[1]=='ship'),len(ships),len(docked),len(active)))
+          with open('/tmp/ships.json','w') as f:json.dump(active,f)
+          for x in active:print('ACTIVE|jst=%s|pair=%s|amounts=%s|hash=%s|tx=%s'%(x['jst'],'/'.join(t['symbol'] for t in x['tokens']),','.join('%s=%s'%(t['symbol'],t['amount']) for t in x['tokens']),x['strategyHash'],x['tx']))
+          PY
+      - name: Decode with official SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sdk && cd /tmp/sdk
+          npm init -y >/dev/null 2>&1
+          npm install --silent @1inch/swap-vm-sdk decimal.js
+          node --input-type=module <<'JS'
+          import fs from 'fs';import Decimal from 'decimal.js';import {Order,HexString,AquaProgramBuilder} from '@1inch/swap-vm-sdk'
+          const ships=JSON.parse(fs.readFileSync('/tmp/ships.json','utf8'));const decoded=[];const F=d=>d.toSignificantDigits(18).toString()
+          for(const s of ships){
+            try{
+              const order=Order.decode(new HexString(s.encodedOrder));const ixs=AquaProgramBuilder.decode(order.program).getInstructions();let range=null;const details=[]
+              for(const ix of ixs){const a=typeof ix.args?.toJSON==='function'?ix.args.toJSON():{};const typ=ix.args?.constructor?.name;details.push({opcode:String(ix.opcode?.id),type:typ,args:a});if(a.sqrtPriceMin!==undefined){const mn=new Decimal(a.sqrtPriceMin).pow(2).div('1e18'),mx=new Decimal(a.sqrtPriceMax).pow(2).div('1e18');const z=[...s.tokens].sort((x,y)=>BigInt(x.address)<BigInt(y.address)?-1:1),lt=z[0],gt=z[1],scale=new Decimal(10).pow(18+gt.decimals-lt.decimals),dmin=mn.div(scale),dmax=mx.div(scale);range={directPair:`${gt.symbol} per ${lt.symbol}`,directMin:F(dmin),directMax:F(dmax),inversePair:`${lt.symbol} per ${gt.symbol}`,inverseMin:F(new Decimal(1).div(dmax)),inverseMax:F(new Decimal(1).div(dmin)),sqrtPriceMin:String(a.sqrtPriceMin),sqrtPriceMax:String(a.sqrtPriceMax)}}
+              const x={...s,range,instructions:details};decoded.push(x);console.log('DECODED|jst=%s|pair=%s|hash=%s|range=%s|instructions=%s',s.jst,s.tokens.map(t=>t.symbol).join('/'),s.strategyHash,JSON.stringify(range),JSON.stringify(details))
+            }catch(e){console.log('DECODE_FAIL|jst=%s|hash=%s|error=%s',s.jst,s.strategyHash,e?.stack||String(e))}
+          }
+          const m=new Map();for(const x of decoded)m.set(x.tokens.map(t=>t.symbol).sort().join('/'),x)
+          for(const [p,x] of [...m.entries()].sort())console.log('LATEST_RANGE|pair=%s|jst=%s|amounts=%s|hash=%s|range=%s|instructions=%s',p,x.jst,x.tokens.map(t=>`${t.symbol}=${t.amount}`).join(','),x.strategyHash,JSON.stringify(x.range),JSON.stringify(x.instructions))
+          JS
