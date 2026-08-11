@@ -1,0 +1,79 @@
+name: Temporary manually decode Aqua ranges
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-ranges-manual.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decode current strategy programs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8'
+          python3 - <<'PY'
+          from web3 import Web3
+          from hexbytes import HexBytes
+          from decimal import Decimal, getcontext
+          getcontext().prec=100
+          TXS=[
+            '0xd3f78f29098c2ba400898c4305f2664b90121722591dbbc2a3cf25350ce9343c',
+            '0x5aabf1fdf4223523c6d84efede0e1ddbae5e374c8a94624e56507b65b8121f5e',
+          ]
+          META={
+            '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
+            '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':('WETH',18),
+            '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599':('WBTC',8),
+          }
+          ABI=[{'type':'function','name':'ship','stateMutability':'nonpayable','inputs':[{'name':'app','type':'address'},{'name':'strategy','type':'bytes'},{'name':'tokens','type':'address[]'},{'name':'amounts','type':'uint256[]'}],'outputs':[{'type':'bytes32'}]}]
+          w3=None
+          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60}));_=c.eth.block_number;w3=c;print('RPC|%s|latest=%s'%(rpc,c.eth.block_number));break
+            except Exception as e:print('RPC_FAIL|%s|%r'%(rpc,e))
+          if w3 is None:raise SystemExit('no rpc')
+          aqua=w3.eth.contract(address=Web3.to_checksum_address('0x1111113ccf1426a8e30e2bff5e005d929bf6a90a'),abi=ABI)
+
+          def decode_order(blob):
+            b=bytes(blob)
+            outer=int.from_bytes(b[0:32],'big'); base=outer
+            maker='0x'+b[base+12:base+32].hex()
+            traits=int.from_bytes(b[base+32:base+64],'big')
+            data_off=int.from_bytes(b[base+64:base+96],'big')
+            pos=base+data_off; data_len=int.from_bytes(b[pos:pos+32],'big'); data=b[pos+32:pos+32+data_len]
+            offsets=(traits>>160)&((1<<64)-1); hooks_end=(offsets>>48)&0xffff
+            return maker,traits,data[hooks_end:]
+
+          def instructions(program):
+            out=[];i=0
+            while i<len(program):
+              op=program[i];ln=program[i+1];arg=program[i+2:i+2+ln]
+              out.append((op,ln,arg));i+=2+ln
+            if i!=len(program):raise ValueError('program length mismatch')
+            return out
+
+          for h in TXS:
+            tx=w3.eth.get_transaction(h);fn,a=aqua.decode_function_input(tx['input'])
+            tokens=[]
+            for addr,raw in zip(a['tokens'],a['amounts']):
+              ad=addr.lower();sym,dec=META[ad];tokens.append({'address':ad,'symbol':sym,'decimals':dec,'amount':Decimal(int(raw))/(Decimal(10)**dec)})
+            maker,traits,program=decode_order(a['strategy']);ix=instructions(program)
+            print('ORDER|tx=%s|maker=%s|traits=%s|pair=%s|amounts=%s|program_len=%s'%(
+              h,maker,hex(traits),'/'.join(x['symbol'] for x in tokens),','.join('%s=%s'%(x['symbol'],x['amount']) for x in tokens),len(program)))
+            for op,ln,arg in ix:print('IX|tx=%s|opcode=%s|len=%s|args=%s'%(h,op,ln,arg.hex()))
+            concentrate=[arg for op,ln,arg in ix if op==18 and ln==64]
+            if not concentrate:
+              print('NO_CONCENTRATE|tx=%s'%h);continue
+            arg=concentrate[0];sqrt_min=int.from_bytes(arg[:32],'big');sqrt_max=int.from_bytes(arg[32:],'big')
+            raw_min=Decimal(sqrt_min)*Decimal(sqrt_min)/Decimal(10**18);raw_max=Decimal(sqrt_max)*Decimal(sqrt_max)/Decimal(10**18)
+            lt,gt=sorted(tokens,key=lambda x:int(x['address'],16));scale=Decimal(10)**(18+gt['decimals']-lt['decimals']);direct_min=raw_min/scale;direct_max=raw_max/scale
+            inv_min=Decimal(1)/direct_max;inv_max=Decimal(1)/direct_min
+            print('RANGE|tx=%s|direct_pair=%s_per_%s|direct_min=%s|direct_max=%s|inverse_pair=%s_per_%s|inverse_min=%s|inverse_max=%s|sqrt_min=%s|sqrt_max=%s|raw_min=%s|raw_max=%s'%(
+              h,gt['symbol'],lt['symbol'],direct_min,direct_max,lt['symbol'],gt['symbol'],inv_min,inv_max,sqrt_min,sqrt_max,raw_min,raw_max))
+          PY
