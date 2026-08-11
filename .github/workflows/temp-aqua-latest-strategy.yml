@@ -1,0 +1,153 @@
+name: Temporary Aqua latest strategy
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-latest-strategy.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decode latest Aqua strategy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8' requests
+          python3 - <<'PY'
+          from web3 import Web3
+          from web3.logs import DISCARD
+          from hexbytes import HexBytes
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone, timedelta
+          import requests, json
+
+          getcontext().prec = 80
+          TARGET='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          AQUA='0x1111113ccf1426a8e30e2bff5e005d929bf6a90a'
+          ROUTER='0x111111338c5091e8440b67b168bae16a668ac0de'
+          BASE='https://eth.blockscout.com/api/v2'
+          START='2026-08-08T00:00:00.000000Z'
+          ABI=[
+            {'type':'function','name':'ship','stateMutability':'nonpayable','inputs':[{'name':'app','type':'address'},{'name':'strategy','type':'bytes'},{'name':'tokens','type':'address[]'},{'name':'amounts','type':'uint256[]'}],'outputs':[{'name':'strategyHash','type':'bytes32'}]},
+            {'type':'function','name':'dock','stateMutability':'nonpayable','inputs':[{'name':'app','type':'address'},{'name':'strategyHash','type':'bytes32'},{'name':'tokens','type':'address[]'}],'outputs':[]},
+            {'type':'event','name':'Shipped','anonymous':False,'inputs':[{'indexed':False,'name':'maker','type':'address'},{'indexed':False,'name':'app','type':'address'},{'indexed':False,'name':'strategyHash','type':'bytes32'},{'indexed':False,'name':'strategy','type':'bytes'}]},
+            {'type':'event','name':'Docked','anonymous':False,'inputs':[{'indexed':False,'name':'maker','type':'address'},{'indexed':False,'name':'app','type':'address'},{'indexed':False,'name':'strategyHash','type':'bytes32'}]},
+          ]
+          ERC20=[
+            {'type':'function','name':'symbol','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},
+            {'type':'function','name':'decimals','stateMutability':'view','inputs':[],'outputs':[{'type':'uint8'}]},
+          ]
+          META={
+            '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
+            '0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0':('wstETH',18),
+            '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':('WETH',18),
+            '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),
+            '0xdac17f958d2ee523a2206206994597c13d831ec7':('USDT',6),
+            '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599':('WBTC',8),
+            '0x1f9840a85d5af5bf1d1762f925bdaddc4201f984':('UNI',18),
+          }
+          session=requests.Session(); session.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          w3=None
+          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60})); latest=c.eth.block_number; w3=c; print(f'RPC|{rpc}|latest={latest}'); break
+            except Exception as exc: print(f'RPC_FAIL|{rpc}|{exc!r}')
+          if w3 is None: raise SystemExit('no rpc')
+          aqua=w3.eth.contract(address=Web3.to_checksum_address(AQUA),abi=ABI)
+          def meta(addr):
+            a=addr.lower()
+            if a in META:return META[a]
+            sym=a[:10]; dec=18
+            try:
+              c=w3.eth.contract(address=Web3.to_checksum_address(a),abi=ERC20)
+              sym=c.functions.symbol().call(); dec=int(c.functions.decimals().call())
+            except Exception: pass
+            META[a]=(sym,dec); return sym,dec
+          def human(raw,dec): return Decimal(int(raw))/(Decimal(10)**dec)
+          def jst(ts): return datetime.fromtimestamp(int(ts),timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
+
+          # Discover direct lifecycle calls.
+          params={}; rows=[]
+          for page in range(1,40):
+            r=session.get(f'{BASE}/addresses/{TARGET}/transactions',params=params,timeout=60); r.raise_for_status(); data=r.json(); items=data.get('items') or []
+            if not items: break
+            oldest=None
+            for item in items:
+              stamp=item.get('timestamp'); oldest=stamp or oldest
+              frm=((item.get('from') or {}).get('hash') or '').lower(); to=((item.get('to') or {}).get('hash') or '').lower(); method=(item.get('method') or '').lower()
+              if frm==TARGET and to==AQUA and method in ('ship','dock'):
+                rows.append({'stamp':stamp,'method':method,'tx':item.get('hash'),'status':item.get('status')})
+            nxt=data.get('next_page_params')
+            if not isinstance(nxt,dict) or not nxt: break
+            params=nxt
+            if oldest and oldest < START: break
+          decoded=[]
+          for row in rows:
+            tx=w3.eth.get_transaction(row['tx']); receipt=w3.eth.get_transaction_receipt(row['tx']); block=w3.eth.get_block(receipt['blockNumber']); ts=int(block['timestamp'])
+            fn,args=aqua.decode_function_input(tx['input'])
+            if row['method']=='ship':
+              evs=aqua.events.Shipped().process_receipt(receipt,errors=DISCARD); sh=None
+              for ev in evs:
+                if ev['args']['maker'].lower()==TARGET: sh='0x'+ev['args']['strategyHash'].hex().removeprefix('0x'); break
+              toks=[x.lower() for x in args['tokens']]; vals=[]
+              for t,raw in zip(toks,args['amounts']):
+                sym,dec=meta(t); vals.append({'token':t,'symbol':sym,'decimals':dec,'raw':int(raw),'amount':human(raw,dec)})
+              decoded.append({'method':'ship','ts':ts,'jst':jst(ts),'tx':row['tx'],'block':receipt['blockNumber'],'app':args['app'].lower(),'strategy_hash':sh,'strategy_bytes':HexBytes(args['strategy']).hex(),'tokens':vals})
+            else:
+              toks=[x.lower() for x in args['tokens']]
+              decoded.append({'method':'dock','ts':ts,'jst':jst(ts),'tx':row['tx'],'block':receipt['blockNumber'],'app':args['app'].lower(),'strategy_hash':'0x'+args['strategyHash'].hex().removeprefix('0x'),'tokens':[{'token':t,'symbol':meta(t)[0]} for t in toks]})
+          decoded.sort(key=lambda x:(x['ts'],x['block']))
+          ships=[x for x in decoded if x['method']=='ship']; docks=[x for x in decoded if x['method']=='dock']
+          latest_ship=ships[-1]
+          later_docks=[x for x in docks if x['ts']>=latest_ship['ts'] and x['strategy_hash'].lower()==latest_ship['strategy_hash'].lower()]
+          print('LIFECYCLE|ship=%s|dock=%s|latest_event=%s|latest_event_time=%s' % (len(ships),len(docks),decoded[-1]['method'],decoded[-1]['jst']))
+          print('LATEST_SHIP|jst=%s|block=%s|tx=%s|app=%s|strategy_hash=%s|active=%s|strategy_bytes_len=%s|strategy_bytes=%s' % (
+            latest_ship['jst'],latest_ship['block'],latest_ship['tx'],latest_ship['app'],latest_ship['strategy_hash'],not bool(later_docks),len(HexBytes(latest_ship['strategy_bytes'])),latest_ship['strategy_bytes']))
+          for v in latest_ship['tokens']:
+            print('LATEST_INITIAL|symbol=%s|token=%s|amount=%s|raw=%s|decimals=%s' % (v['symbol'],v['token'],v['amount'],v['raw'],v['decimals']))
+          if later_docks:
+            for d in later_docks: print('LATEST_DOCK|jst=%s|tx=%s' % (d['jst'],d['tx']))
+
+          # Discover all target-related transfer txs after latest ship, then decode fills for this strategy.
+          cutoff=datetime.fromtimestamp(latest_ship['ts'],timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000000Z')
+          params={'type':'ERC-20'}; txs=set()
+          for page in range(1,80):
+            r=session.get(f'{BASE}/addresses/{TARGET}/token-transfers',params=params,timeout=60); r.raise_for_status(); data=r.json(); items=data.get('items') or []
+            if not items: break
+            oldest=None
+            for item in items:
+              stamp=item.get('timestamp'); oldest=stamp or oldest
+              if stamp and stamp>=cutoff and item.get('transaction_hash'): txs.add(item['transaction_hash'])
+            nxt=data.get('next_page_params')
+            if not isinstance(nxt,dict) or not nxt or (oldest and oldest<cutoff): break
+            params={'type':'ERC-20',**nxt}
+          SW=Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex(); fills=[]
+          wanted=latest_ship['strategy_hash'].lower().removeprefix('0x')
+          for txh in txs:
+            receipt=w3.eth.get_transaction_receipt(txh); block=w3.eth.get_block(receipt['blockNumber']); ts=int(block['timestamp'])
+            for log in receipt['logs']:
+              if log['address'].lower()!=ROUTER or not log['topics'] or log['topics'][0].hex()!=SW: continue
+              v=w3.codec.decode(['bytes32','address','address','address','address','uint256','uint256'],HexBytes(log['data']))
+              sh=v[0].hex().removeprefix('0x')
+              if v[1].lower()!=TARGET or sh.lower()!=wanted: continue
+              ti=v[3].lower(); to=v[4].lower(); si,di=meta(ti); so,do=meta(to)
+              fills.append({'ts':ts,'jst':jst(ts),'tx':txh,'token_in':ti,'symbol_in':si,'amount_in':human(v[5],di),'token_out':to,'symbol_out':so,'amount_out':human(v[6],do)})
+          fills.sort(key=lambda x:x['ts'])
+          balances={v['token']:v['amount'] for v in latest_ship['tokens']}
+          for f in fills:
+            balances[f['token_in']]=balances.get(f['token_in'],Decimal(0))+f['amount_in']
+            balances[f['token_out']]=balances.get(f['token_out'],Decimal(0))-f['amount_out']
+          print('LATEST_FILL_COUNT|%s' % len(fills))
+          for f in fills: print('LATEST_FILL|jst=%s|pair=%s->%s|amount_in=%s|amount_out=%s|tx=%s' % (f['jst'],f['symbol_in'],f['symbol_out'],f['amount_in'],f['amount_out'],f['tx']))
+          for t,b in balances.items(): print('LATEST_INFERRED_BALANCE|symbol=%s|token=%s|amount=%s' % (meta(t)[0],t,b))
+
+          # Print five latest ships and whether later docked.
+          docked={x['strategy_hash'].lower() for x in docks}
+          for x in ships[-5:]:
+            amts=','.join('%s=%s' % (v['symbol'],v['amount']) for v in x['tokens'])
+            print('RECENT_SHIP|jst=%s|amounts=%s|strategy=%s|active=%s|tx=%s' % (x['jst'],amts,x['strategy_hash'],x['strategy_hash'].lower() not in docked,x['tx']))
+          PY
