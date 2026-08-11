@@ -1,0 +1,108 @@
+name: Temporary E01e outflow trace
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-e01e-outflow-trace.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect direct outflows and second hops
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import requests,time
+          from collections import defaultdict
+          from decimal import Decimal,getcontext
+          from datetime import datetime,timezone,timedelta
+          getcontext().prec=80
+          T='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          START='2026-08-04T00:00:00.000000Z'
+          BASE='https://eth.blockscout.com/api/v2'
+          A6='0xa6ae8e0d2e294018dd3e36caf6c828b79236f71d'
+          F5='0xf5947f530b2a67b3d9ef211c10abba06c6c3a836'
+          S=requests.Session();S.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def get(path,params=None):
+            for i in range(5):
+              r=S.get(BASE+path,params=params,timeout=60)
+              if r.status_code==429 or r.status_code>=500:time.sleep(1+i);continue
+              r.raise_for_status();return r.json()
+            raise RuntimeError(path)
+          def pages(path,params=None,cut=START,maxp=100):
+            p=dict(params or {});out=[]
+            for _ in range(maxp):
+              d=get(path,p);items=d.get('items') or []
+              if not items:break
+              oldest=None
+              for x in items:
+                st=x.get('timestamp');oldest=st or oldest
+                if not st or st>=cut:out.append(x)
+              n=d.get('next_page_params')
+              if not isinstance(n,dict) or not n or (oldest and oldest<cut):break
+              p={**(params or {}),**n}
+            return out
+          def ah(x):return ((x or {}).get('hash') or '').lower() if isinstance(x,dict) else ''
+          def label(x):
+            x=x or {};v=[]
+            for k in ('name','ens_domain_name','implementation_name'):
+              if x.get(k):v.append(str(x[k]))
+            for k in ('public_tags','watchlist_names'):
+              for z in x.get(k) or []:
+                if isinstance(z,dict):
+                  q=z.get('display_name') or z.get('name') or z.get('label')
+                  if q:v.append(str(q))
+            m=x.get('metadata') or {}
+            if isinstance(m,dict) and m.get('name'):v.append(str(m['name']))
+            return ';'.join(dict.fromkeys(v)) or '-'
+          def amt(x):
+            q=x.get('total') or {};tok=x.get('token') or {};d=q.get('decimals',tok.get('decimals',0))
+            try:return Decimal(str(q.get('value') or 0))/(Decimal(10)**int(d or 0))
+            except:return Decimal(0)
+          def rate(x):
+            try:return Decimal(str((x.get('token') or {}).get('exchange_rate') or 0))
+            except:return Decimal(0)
+          def sym(x):return str((x.get('token') or {}).get('symbol') or '?')
+          def jst(st):
+            if not st:return '-'
+            return datetime.fromisoformat(st.replace('Z','+00:00')).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
+          now=datetime.now(timezone.utc);print('SNAPSHOT|jst=%s'%now.astimezone(timezone(timedelta(hours=9))).isoformat())
+          holds=get(f'/addresses/{T}/tokens',{'type':'ERC-20'}).get('items') or []
+          for x in holds:
+            tok=x.get('token') or {};d=int(tok.get('decimals') or 0);a=Decimal(str(x.get('value') or 0))/(Decimal(10)**d);usd=a*Decimal(str(tok.get('exchange_rate') or 0))
+            if a:print('HOLD|symbol=%s|amount=%s|usd=%s|token=%s'%(tok.get('symbol'),a,usd,tok.get('address_hash')))
+          trans=pages(f'/addresses/{T}/token-transfers',{'type':'ERC-20'})
+          txcache={}
+          def tx(h):
+            if h not in txcache:
+              try:txcache[h]=get('/transactions/'+h)
+              except Exception as e:txcache[h]={'error':repr(e)}
+            return txcache[h]
+          direct=[]
+          for x in trans:
+            if ah(x.get('from'))!=T:continue
+            h=x.get('transaction_hash');z=tx(h);topfrom=ah(z.get('from'));topto=ah(z.get('to'));method=str(z.get('method') or x.get('method') or '')
+            if topfrom==T:
+              direct.append(x)
+              print('DIRECT_OUT|jst=%s|symbol=%s|amount=%s|usd=%s|to=%s|to_contract=%s|to_label=%s|tx=%s|top_to=%s|method=%s'%(jst(x.get('timestamp')),sym(x),amt(x),amt(x)*rate(x),ah(x.get('to')),(x.get('to') or {}).get('is_contract'),label(x.get('to')),h,topto,method))
+          agg=defaultdict(lambda:{'usd':Decimal(0),'t':defaultdict(Decimal),'obj':None,'first':None,'last':None,'txs':set()})
+          for x in direct:
+            to=ah(x.get('to'));a=agg[to];a['usd']+=amt(x)*rate(x);a['t'][sym(x)]+=amt(x);a['obj']=x.get('to');a['txs'].add(x.get('transaction_hash'));st=x.get('timestamp');a['first']=min(a['first'],st) if a['first'] else st;a['last']=max(a['last'],st) if a['last'] else st
+          for to,a in sorted(agg.items(),key=lambda kv:kv[1]['usd'],reverse=True):
+            print('DEST|address=%s|contract=%s|label=%s|usd=%s|tokens=%s|txs=%s|first=%s|last=%s'%(to,(a['obj'] or {}).get('is_contract'),label(a['obj']),a['usd'],','.join('%s=%s'%q for q in sorted(a['t'].items())),len(a['txs']),jst(a['first']),jst(a['last'])))
+          follow=set([to for to,a in agg.items() if not (a['obj'] or {}).get('is_contract')])|{A6,F5}
+          for f in sorted(follow):
+            outs=[x for x in pages(f'/addresses/{f}/token-transfers',{'type':'ERC-20'},maxp=50) if ah(x.get('from'))==f]
+            b=defaultdict(lambda:{'usd':Decimal(0),'t':defaultdict(Decimal),'obj':None,'first':None,'last':None,'txs':set()})
+            for x in outs:
+              to=ah(x.get('to'));a=b[to];a['usd']+=amt(x)*rate(x);a['t'][sym(x)]+=amt(x);a['obj']=x.get('to');a['txs'].add(x.get('transaction_hash'));st=x.get('timestamp');a['first']=min(a['first'],st) if a['first'] else st;a['last']=max(a['last'],st) if a['last'] else st
+            print('FOLLOW|address=%s|out_count=%s'%(f,len(outs)))
+            for to,a in sorted(b.items(),key=lambda kv:kv[1]['usd'],reverse=True)[:30]:
+              print('HOP2|from=%s|to=%s|contract=%s|label=%s|usd=%s|tokens=%s|txs=%s|first=%s|last=%s'%(f,to,(a['obj'] or {}).get('is_contract'),label(a['obj']),a['usd'],','.join('%s=%s'%q for q in sorted(a['t'].items())),len(a['txs']),jst(a['first']),jst(a['last'])))
+          PY
