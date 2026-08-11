@@ -12,20 +12,21 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Aggregate recent SwapVM fills
+      - name: Aggregate recent fills through receipts
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'web3>=7,<8'
+          python3 -m pip install --quiet 'web3>=7,<8' requests
           python3 - <<'PY'
           from web3 import Web3
           from hexbytes import HexBytes
           from decimal import Decimal, getcontext
           from datetime import datetime, timezone, timedelta
-          import time
+          import requests
           getcontext().prec=80
           TARGET='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
           ROUTER='0x111111338c5091e8440b67b168bae16a668ac0de'
+          CUTOFF='2026-08-09T00:00:00.000000Z'
           META={
             '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
             '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),
@@ -41,17 +42,12 @@ jobs:
             '0x5a98fcbea516cf06857215779fd812ca3bef1b32':('LDO',18),
           }
           ERC20=[{'type':'function','name':'symbol','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},{'type':'function','name':'decimals','stateMutability':'view','inputs':[],'outputs':[{'type':'uint8'}]}]
-          providers=[]
-          for rpc in ['https://eth.llamarpc.com','https://1rpc.io/eth','https://ethereum-rpc.publicnode.com']:
+          w3=None
+          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
             try:
-              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':90})); latest=c.eth.block_number
-              # Confirm eth_getLogs is enabled before selecting it.
-              _=c.eth.get_logs({'fromBlock':latest-10,'toBlock':latest,'address':Web3.to_checksum_address(ROUTER)})
-              providers.append((rpc,c,latest)); print('LOG_RPC_OK|%s|latest=%s' % (rpc,latest))
-            except Exception as exc: print('LOG_RPC_FAIL|%s|%r' % (rpc,exc))
-          if not providers: raise SystemExit('no log-capable RPC')
-          rpc,w3,latest=providers[0]
-          cache={}
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60})); _=c.eth.block_number; w3=c; print('RPC|%s' % rpc); break
+            except Exception as exc: print('RPC_FAIL|%s|%r' % (rpc,exc))
+          if w3 is None:raise SystemExit('no rpc')
           def meta(addr):
             addr=addr.lower()
             if addr in META:return META[addr]
@@ -60,31 +56,37 @@ jobs:
               c=w3.eth.contract(address=Web3.to_checksum_address(addr),abi=ERC20);sym=c.functions.symbol().call();dec=int(c.functions.decimals().call())
             except Exception:pass
             META[addr]=(sym,dec);return sym,dec
-          def ts(block):
-            if block not in cache:cache[block]=int(w3.eth.get_block(block)['timestamp'])
-            return cache[block]
-          def jst(stamp):return datetime.fromtimestamp(stamp,timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
           def H(raw,dec):return Decimal(raw)/(Decimal(10)**dec)
-          topic=Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex()
-          rawlogs=[]
-          for a in range(25713000,latest+1,250):
-            b=min(latest,a+249); ok=False
-            for attempt in range(4):
-              try:
-                rawlogs.extend(w3.eth.get_logs({'fromBlock':a,'toBlock':b,'address':Web3.to_checksum_address(ROUTER),'topics':[topic]}));ok=True;break
-              except Exception as exc:
-                print('CHUNK_RETRY|%s|%s|attempt=%s|%r' % (a,b,attempt+1,exc));time.sleep(1+attempt)
-            if not ok:print('CHUNK_SKIP|%s|%s' % (a,b))
-          fills=[]
-          for log in rawlogs:
-            v=w3.codec.decode(['bytes32','address','address','address','address','uint256','uint256'],HexBytes(log['data']))
-            if v[1].lower()!=TARGET:continue
-            ti=v[3].lower();to=v[4].lower();si,di=meta(ti);so,do=meta(to);stamp=ts(int(log['blockNumber']))
-            fills.append({'ts':stamp,'tx':log['transactionHash'].hex(),'strategy':'0x'+v[0].hex(),'sin':si,'ain':H(v[5],di),'sout':so,'aout':H(v[6],do)})
-          fills.sort(key=lambda x:x['ts']);agg={}
+          def JST(ts):return datetime.fromtimestamp(ts,timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
+
+          # Use Blockscout only to discover tx hashes involving the address, then decode authoritative receipt events.
+          base=f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/token-transfers';params={'type':'ERC-20'};txs=set()
+          for page in range(1,60):
+            r=requests.get(base,params=params,timeout=60,headers={'user-agent':'Mozilla/5.0','accept':'application/json'});r.raise_for_status();data=r.json();items=data.get('items') or []
+            if not items:break
+            oldest=None
+            for x in items:
+              stamp=x.get('timestamp');oldest=stamp or oldest
+              if stamp and stamp>=CUTOFF and x.get('transaction_hash'):txs.add(x['transaction_hash'])
+            nxt=data.get('next_page_params')
+            if not isinstance(nxt,dict) or not nxt or (oldest and oldest<CUTOFF):break
+            params={'type':'ERC-20',**nxt}
+          print('DISCOVERED_TXS|%s' % len(txs))
+          topic=Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex();fills=[]
+          for i,txh in enumerate(sorted(txs)):
+            try:receipt=w3.eth.get_transaction_receipt(txh)
+            except Exception as exc:print('RECEIPT_FAIL|%s|%r' % (txh,exc));continue
+            stamp=int(w3.eth.get_block(receipt['blockNumber'])['timestamp'])
+            for log in receipt['logs']:
+              if log['address'].lower()!=ROUTER or not log['topics'] or log['topics'][0].hex()!=topic:continue
+              v=w3.codec.decode(['bytes32','address','address','address','address','uint256','uint256'],HexBytes(log['data']))
+              if v[1].lower()!=TARGET:continue
+              ti=v[3].lower();to=v[4].lower();si,di=meta(ti);so,do=meta(to)
+              fills.append({'ts':stamp,'tx':txh,'strategy':'0x'+v[0].hex(),'sin':si,'ain':H(v[5],di),'sout':so,'aout':H(v[6],do)})
+          fills.sort(key=lambda x:(x['ts'],x['tx'],x['strategy']));agg={}
           for f in fills:
             k=(f['strategy'],f['sin'],f['sout']);g=agg.setdefault(k,[0,Decimal(0),Decimal(0),f['ts'],f['ts']]);g[0]+=1;g[1]+=f['ain'];g[2]+=f['aout'];g[3]=min(g[3],f['ts']);g[4]=max(g[4],f['ts'])
-          print('FILL_TOTAL|count=%s|strategy_directions=%s|first=%s|last=%s' % (len(fills),len(agg),jst(fills[0]['ts']) if fills else None,jst(fills[-1]['ts']) if fills else None))
-          for (strategy,si,so),g in sorted(agg.items(),key=lambda z:(z[1][4],z[0])):print('FILL_GROUP|pair=%s->%s|count=%s|amount_in=%s|amount_out=%s|first=%s|last=%s|strategy=%s' % (si,so,g[0],g[1],g[2],jst(g[3]),jst(g[4]),strategy))
-          for f in fills[-40:]:print('FILL|jst=%s|pair=%s->%s|amount_in=%s|amount_out=%s|strategy=%s|tx=%s' % (jst(f['ts']),f['sin'],f['sout'],f['ain'],f['aout'],f['strategy'],f['tx']))
+          print('FILL_TOTAL|count=%s|strategy_directions=%s|first=%s|last=%s' % (len(fills),len(agg),JST(fills[0]['ts']) if fills else None,JST(fills[-1]['ts']) if fills else None))
+          for (strategy,si,so),g in sorted(agg.items(),key=lambda z:(z[1][4],z[0])):print('FILL_GROUP|pair=%s->%s|count=%s|amount_in=%s|amount_out=%s|first=%s|last=%s|strategy=%s' % (si,so,g[0],g[1],g[2],JST(g[3]),JST(g[4]),strategy))
+          for f in fills[-50:]:print('FILL|jst=%s|pair=%s->%s|amount_in=%s|amount_out=%s|strategy=%s|tx=%s' % (JST(f['ts']),f['sin'],f['sout'],f['ain'],f['aout'],f['strategy'],f['tx']))
           PY
