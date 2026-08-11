@@ -12,120 +12,79 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Decode recent Aqua strategies and fills
+      - name: Aggregate recent SwapVM fills
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'web3>=7,<8' requests
+          python3 -m pip install --quiet 'web3>=7,<8'
           python3 - <<'PY'
           from web3 import Web3
           from hexbytes import HexBytes
           from decimal import Decimal, getcontext
           from datetime import datetime, timezone, timedelta
-          from collections import defaultdict
-          import requests
+          import time
           getcontext().prec=80
           TARGET='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
-          AQUA='0x1111113ccf1426a8e30e2bff5e005d929bf6a90a'
           ROUTER='0x111111338c5091e8440b67b168bae16a668ac0de'
-          START_DATE='2026-08-08T00:00:00.000000Z'
-          ABI=[
-            {'type':'function','name':'ship','stateMutability':'nonpayable','inputs':[{'name':'app','type':'address'},{'name':'strategy','type':'bytes'},{'name':'tokens','type':'address[]'},{'name':'amounts','type':'uint256[]'}],'outputs':[{'name':'strategyHash','type':'bytes32'}]},
-            {'type':'function','name':'dock','stateMutability':'nonpayable','inputs':[{'name':'app','type':'address'},{'name':'strategyHash','type':'bytes32'},{'name':'tokens','type':'address[]'}],'outputs':[]},
-            {'type':'event','name':'Shipped','anonymous':False,'inputs':[{'indexed':False,'name':'maker','type':'address'},{'indexed':False,'name':'app','type':'address'},{'indexed':False,'name':'strategyHash','type':'bytes32'},{'indexed':False,'name':'strategy','type':'bytes'}]},
-            {'type':'event','name':'Docked','anonymous':False,'inputs':[{'indexed':False,'name':'maker','type':'address'},{'indexed':False,'name':'app','type':'address'},{'indexed':False,'name':'strategyHash','type':'bytes32'}]},
-          ]
-          ERC20=[
-            {'type':'function','name':'symbol','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},
-            {'type':'function','name':'decimals','stateMutability':'view','inputs':[],'outputs':[{'type':'uint8'}]},
-          ]
-          w3=None
-          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
-            try:
-              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60})); latest=c.eth.block_number; w3=c; print('RPC|%s|latest=%s' % (rpc,latest)); break
-            except Exception as exc: print('RPC_FAIL|%s|%r' % (rpc,exc))
-          if w3 is None: raise SystemExit('no rpc')
-          aqua=w3.eth.contract(address=Web3.to_checksum_address(AQUA),abi=ABI)
-          meta_cache={
+          META={
             '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
             '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),
+            '0xdac17f958d2ee523a2206206994597c13d831ec7':('USDT',6),
+            '0x6b175474e89094c44da98b954eedeac495271d0f':('DAI',18),
+            '0x6c3ea9036406852006290770bedfcaba0e23a0e8':('PYUSD',6),
             '0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0':('wstETH',18),
             '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':('WETH',18),
             '0xae7ab96520de3a18e5e111b5eaab095312d7fe84':('stETH',18),
             '0xbe9895146f7af43049ca1c1ae358b0541ea49704':('cbETH',18),
+            '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599':('WBTC',8),
             '0x1f9840a85d5af5bf1d1762f925bdaddc4201f984':('UNI',18),
+            '0x5a98fcbea516cf06857215779fd812ca3bef1b32':('LDO',18),
           }
+          ERC20=[{'type':'function','name':'symbol','stateMutability':'view','inputs':[],'outputs':[{'type':'string'}]},{'type':'function','name':'decimals','stateMutability':'view','inputs':[],'outputs':[{'type':'uint8'}]}]
+          providers=[]
+          for rpc in ['https://eth.llamarpc.com','https://1rpc.io/eth','https://ethereum-rpc.publicnode.com']:
+            try:
+              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':90})); latest=c.eth.block_number
+              # Confirm eth_getLogs is enabled before selecting it.
+              _=c.eth.get_logs({'fromBlock':latest-10,'toBlock':latest,'address':Web3.to_checksum_address(ROUTER)})
+              providers.append((rpc,c,latest)); print('LOG_RPC_OK|%s|latest=%s' % (rpc,latest))
+            except Exception as exc: print('LOG_RPC_FAIL|%s|%r' % (rpc,exc))
+          if not providers: raise SystemExit('no log-capable RPC')
+          rpc,w3,latest=providers[0]
+          cache={}
           def meta(addr):
             addr=addr.lower()
-            if addr in meta_cache:return meta_cache[addr]
-            sym=addr[:10]; dec=18
+            if addr in META:return META[addr]
+            sym=addr[:10];dec=18
             try:
-              c=w3.eth.contract(address=Web3.to_checksum_address(addr),abi=ERC20); sym=c.functions.symbol().call(); dec=int(c.functions.decimals().call())
-            except Exception: pass
-            meta_cache[addr]=(sym,dec); return sym,dec
-          def human(raw,dec): return Decimal(raw)/(Decimal(10)**dec)
-          def jst(ts): return datetime.fromtimestamp(ts,timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
-
-          # Direct lifecycle calls since Aug 8.
-          base=f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/transactions'; params={}; life=[]
-          for page in range(1,20):
-            r=requests.get(base,params=params,timeout=60,headers={'user-agent':'Mozilla/5.0','accept':'application/json'}); r.raise_for_status(); data=r.json(); items=data.get('items') or []
-            if not items: break
-            oldest=None
-            for item in items:
-              stamp=item.get('timestamp'); oldest=stamp or oldest
-              if stamp and stamp < START_DATE: continue
-              if ((item.get('from') or {}).get('hash') or '').lower()!=TARGET: continue
-              if ((item.get('to') or {}).get('hash') or '').lower()!=AQUA: continue
-              method=(item.get('method') or '').lower()
-              if method in ('ship','dock'): life.append({'timestamp':stamp,'method':method,'tx':item.get('hash')})
-            nxt=data.get('next_page_params')
-            if not isinstance(nxt,dict) or not nxt or (oldest and oldest<START_DATE): break
-            params=nxt
-          life.sort(key=lambda x:x['timestamp'])
-          ship_pairs=defaultdict(int); decoded_life=[]
-          for row in life:
-            tx=w3.eth.get_transaction(row['tx']); receipt=w3.eth.get_transaction_receipt(row['tx']); block=w3.eth.get_block(receipt['blockNumber']); ts=int(block['timestamp'])
-            try: fn,args=aqua.decode_function_input(tx['input'])
-            except Exception as exc:
-              decoded_life.append({**row,'jst':jst(ts),'decode_error':repr(exc)}); continue
-            if row['method']=='ship':
-              tokens=[x.lower() for x in args['tokens']]; amounts=[int(x) for x in args['amounts']]; token_rows=[]
-              for token,amount in zip(tokens,amounts):
-                sym,dec=meta(token); token_rows.append((sym,human(amount,dec),token))
-              names=sorted(x[0] for x in token_rows); pair='/'.join(names); ship_pairs[pair]+=1
-              strategy_hash=None
+              c=w3.eth.contract(address=Web3.to_checksum_address(addr),abi=ERC20);sym=c.functions.symbol().call();dec=int(c.functions.decimals().call())
+            except Exception:pass
+            META[addr]=(sym,dec);return sym,dec
+          def ts(block):
+            if block not in cache:cache[block]=int(w3.eth.get_block(block)['timestamp'])
+            return cache[block]
+          def jst(stamp):return datetime.fromtimestamp(stamp,timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
+          def H(raw,dec):return Decimal(raw)/(Decimal(10)**dec)
+          topic=Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex()
+          rawlogs=[]
+          for a in range(25713000,latest+1,250):
+            b=min(latest,a+249); ok=False
+            for attempt in range(4):
               try:
-                events=aqua.events.Shipped().process_receipt(receipt)
-                for ev in events:
-                  if ev['args']['maker'].lower()==TARGET: strategy_hash=ev['args']['strategyHash'].hex(); break
-              except Exception: pass
-              decoded_life.append({'method':'ship','jst':jst(ts),'tx':row['tx'],'pair':pair,'tokens':token_rows,'strategy_hash':strategy_hash,'app':args['app'].lower()})
-            else:
-              tokens=[x.lower() for x in args['tokens']]; names=[meta(x)[0] for x in tokens]
-              decoded_life.append({'method':'dock','jst':jst(ts),'tx':row['tx'],'pair':'/'.join(sorted(names)),'strategy_hash':args['strategyHash'].hex(),'app':args['app'].lower()})
-          print('LIFECYCLE_TOTAL|ship=%s|dock=%s' % (sum(1 for x in decoded_life if x.get('method')=='ship'),sum(1 for x in decoded_life if x.get('method')=='dock')))
-          for pair,count in sorted(ship_pairs.items(),key=lambda x:(-x[1],x[0])): print('SHIP_PAIR_COUNT|pair=%s|count=%s' % (pair,count))
-          for x in decoded_life[-30:]:
-            if x.get('method')=='ship': print('SHIP|jst=%s|pair=%s|amounts=%s|strategy=%s|tx=%s' % (x['jst'],x['pair'],','.join('%s=%s' % (a,b) for a,b,_ in x['tokens']),x['strategy_hash'],x['tx']))
-            elif x.get('method')=='dock': print('DOCK|jst=%s|pair=%s|strategy=%s|tx=%s' % (x['jst'],x['pair'],x['strategy_hash'],x['tx']))
-
-          # Exact SwapVM fills since Aug 9 00:00 UTC (known start block just before period).
-          SW=Web3.keccak(text='Swapped(bytes32,address,address,address,address,uint256,uint256)').hex(); start=25713000; logs=[]
-          for a in range(start,latest+1,1000):
-            b=min(latest,a+999)
-            try: logs.extend(w3.eth.get_logs({'fromBlock':a,'toBlock':b,'address':Web3.to_checksum_address(ROUTER),'topics':[SW]}))
-            except Exception as exc: print('LOG_FAIL|%s|%s|%r' % (a,b,exc))
+                rawlogs.extend(w3.eth.get_logs({'fromBlock':a,'toBlock':b,'address':Web3.to_checksum_address(ROUTER),'topics':[topic]}));ok=True;break
+              except Exception as exc:
+                print('CHUNK_RETRY|%s|%s|attempt=%s|%r' % (a,b,attempt+1,exc));time.sleep(1+attempt)
+            if not ok:print('CHUNK_SKIP|%s|%s' % (a,b))
           fills=[]
-          for log in logs:
+          for log in rawlogs:
             v=w3.codec.decode(['bytes32','address','address','address','address','uint256','uint256'],HexBytes(log['data']))
-            if v[1].lower()!=TARGET: continue
-            ti=v[3].lower(); to=v[4].lower(); si,di=meta(ti); so,do=meta(to); block=w3.eth.get_block(log['blockNumber']); ts=int(block['timestamp'])
-            fills.append({'ts':ts,'jst':jst(ts),'tx':log['transactionHash'].hex(),'strategy':'0x'+v[0].hex(),'taker':v[2].lower(),'sin':si,'ain':human(v[5],di),'sout':so,'aout':human(v[6],do)})
-          fills.sort(key=lambda x:x['ts']); agg={}
+            if v[1].lower()!=TARGET:continue
+            ti=v[3].lower();to=v[4].lower();si,di=meta(ti);so,do=meta(to);stamp=ts(int(log['blockNumber']))
+            fills.append({'ts':stamp,'tx':log['transactionHash'].hex(),'strategy':'0x'+v[0].hex(),'sin':si,'ain':H(v[5],di),'sout':so,'aout':H(v[6],do)})
+          fills.sort(key=lambda x:x['ts']);agg={}
           for f in fills:
-            k=(f['strategy'],f['sin'],f['sout']); g=agg.setdefault(k,[0,Decimal(0),Decimal(0),f['ts'],f['ts']]); g[0]+=1; g[1]+=f['ain']; g[2]+=f['aout']; g[3]=min(g[3],f['ts']); g[4]=max(g[4],f['ts'])
-          print('FILL_TOTAL|count=%s|strategies=%s' % (len(fills),len(agg)))
-          for (strategy,si,so),g in sorted(agg.items(),key=lambda z:z[1][4]): print('FILL_GROUP|pair=%s->%s|count=%s|amount_in=%s|amount_out=%s|first=%s|last=%s|strategy=%s' % (si,so,g[0],g[1],g[2],jst(g[3]),jst(g[4]),strategy))
-          for f in fills[-30:]: print('FILL|jst=%s|pair=%s->%s|amount_in=%s|amount_out=%s|strategy=%s|tx=%s' % (f['jst'],f['sin'],f['sout'],f['ain'],f['aout'],f['strategy'],f['tx']))
+            k=(f['strategy'],f['sin'],f['sout']);g=agg.setdefault(k,[0,Decimal(0),Decimal(0),f['ts'],f['ts']]);g[0]+=1;g[1]+=f['ain'];g[2]+=f['aout'];g[3]=min(g[3],f['ts']);g[4]=max(g[4],f['ts'])
+          print('FILL_TOTAL|count=%s|strategy_directions=%s|first=%s|last=%s' % (len(fills),len(agg),jst(fills[0]['ts']) if fills else None,jst(fills[-1]['ts']) if fills else None))
+          for (strategy,si,so),g in sorted(agg.items(),key=lambda z:(z[1][4],z[0])):print('FILL_GROUP|pair=%s->%s|count=%s|amount_in=%s|amount_out=%s|first=%s|last=%s|strategy=%s' % (si,so,g[0],g[1],g[2],jst(g[3]),jst(g[4]),strategy))
+          for f in fills[-40:]:print('FILL|jst=%s|pair=%s->%s|amount_in=%s|amount_out=%s|strategy=%s|tx=%s' % (jst(f['ts']),f['sin'],f['sout'],f['ain'],f['aout'],f['strategy'],f['tx']))
           PY
