@@ -1,0 +1,91 @@
+name: Temporary Aqua current top4 ranges
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-current-top4.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decode current open ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, requests, time
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone, timedelta
+          getcontext().prec=100
+          ADDRS=[
+            ('1','0xe22259232b3cf5c74104cf2ded7f878f0201b198'),
+            ('2','0x3bb5c8a00190da68059f0f66c24794584eb10d07'),
+            ('3','0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'),
+            ('4','0x50e01433711f0cde93d09856405f64a579fa5244'),
+          ]
+          URL='https://api.1inch.com/mcp/protocol';V='2025-11-25'
+          s=requests.Session();s.headers.update({'accept':'application/json, text/event-stream','content-type':'application/json','user-agent':'aqua-current-top4'})
+          sid=None;rid=0
+          def parse(t,i):
+            t=t.replace('\r\n','\n');msgs=[]
+            for block in t.split('\n\n'):
+              data=[x[5:].lstrip() for x in block.split('\n') if x.startswith('data:')]
+              if not data:continue
+              p='\n'.join(data)
+              if p=='[DONE]':continue
+              msgs.append(json.loads(p))
+            for m in msgs:
+              if str(m.get('id'))==str(i):return m
+            raise RuntimeError('missing')
+          def req(method,params,notify=False):
+            global sid,rid
+            if notify:p={'jsonrpc':'2.0','method':method,'params':params};i=None
+            else:rid+=1;i=rid;p={'jsonrpc':'2.0','id':i,'method':method,'params':params}
+            for n in range(6):
+              h={'MCP-Protocol-Version':V}
+              if sid:h['Mcp-Session-Id']=sid
+              try:
+                r=s.post(URL,json=p,headers=h,timeout=90)
+                if r.status_code==429 or r.status_code>=500:time.sleep(n+1);continue
+                r.raise_for_status()
+                if r.headers.get('mcp-session-id'):sid=r.headers['mcp-session-id']
+                if notify:return
+                e=parse(r.text,i)
+                if e.get('error'):raise RuntimeError(e['error'])
+                return e['result']
+              except Exception as exc:
+                if n==5:raise
+                print('RETRY|method=%s|attempt=%s|error=%r'%(method,n+1,exc));time.sleep(n+1)
+          req('initialize',{'protocolVersion':V,'capabilities':{},'clientInfo':{'name':'current-top4','version':'1'}});req('notifications/initialized',{},True)
+          def call(args):
+            r=req('tools/call',{'name':'aqua','arguments':args})
+            if r.get('isError'):raise RuntimeError(r)
+            if r.get('structuredContent') is not None:return r['structuredContent']
+            for x in r.get('content') or []:
+              if isinstance(x,dict) and isinstance(x.get('text'),str):
+                try:return json.loads(x['text'])
+                except:pass
+            return r
+          def decode(x):
+            b=bytes.fromhex(x['strategyBytes'].removeprefix('0x'));n=int.from_bytes(b[128:160],'big');p=b[160:160+n]
+            lo=min(int.from_bytes(p[50:82],'big'),int.from_bytes(p[82:114],'big'));hi=max(int.from_bytes(p[50:82],'big'),int.from_bytes(p[82:114],'big'))
+            rlo=(Decimal(lo)/Decimal(10**18))**2;rhi=(Decimal(hi)/Decimal(10**18))**2
+            t0,t1=x['tokens'][:2];a0=t0['address'].lower();a1=t1['address'].lower();d0=int(t0['meta']['decimals']);d1=int(t1['meta']['decimals']);s0=t0['meta']['symbol'];s1=t1['meta']['symbol']
+            if int(a0,16)<int(a1,16):mn=rlo*Decimal(10)**(d0-d1);mx=rhi*Decimal(10)**(d0-d1)
+            else:qmn=rlo*Decimal(10)**(d1-d0);qmx=rhi*Decimal(10)**(d1-d0);mn=Decimal(1)/qmx;mx=Decimal(1)/qmn
+            mid=(mn+mx)/2;w=(mx-mn)/mid*100
+            return s0+'/'+s1,mn,mx,w
+          def j(ts):return datetime.fromtimestamp(int(ts),timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
+          for rank,a in ADDRS:
+            d=call({'action':'list_maker_strategies','address':a,'status':['open'],'limit':100});items=d.get('items') or []
+            print('ADDRESS|rank=%s|address=%s|open=%s'%(rank,a,len(items)))
+            for x in sorted(items,key=lambda z:int(z.get('openedAt') or 0),reverse=True):
+              pair,mn,mx,w=decode(x)
+              v=float(x.get('performance',{}).get('volume',{}).get('last7d',{}).get('usd') or 0);fee=(x.get('classification') or {}).get('feePercent')
+              print('OPEN|rank=%s|address=%s|pair=%s|opened=%s|min=%s|max=%s|widthPct=%s|feePct=%s|volume7dUsd=%s|hash=%s'%(rank,a,pair,j(x['openedAt']),mn,mx,w,fee,v,x['strategyHash']))
+          PY
